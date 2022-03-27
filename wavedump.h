@@ -12,6 +12,10 @@ typedef struct {
 	FILE *file;
 	uint32 loop_sample;
 	uint32 data_size;
+	int ismem;
+	uint8 *mem;
+	uint32 memsize;
+	uint32 len;
 } wavedump_t;
 
 ao_bool wavedump_open(wavedump_t *wave, const char *fn);

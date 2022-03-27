@@ -7,7 +7,9 @@
  */
 
 #include <assert.h>
+#include <fcntl.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include "ao.h"
 #include "utils.h"
@@ -57,6 +59,34 @@ typedef struct {
 	uint32 dwSampleOffset; // offset from [dwBlockStart] to the sample
 } CUEPOINT;
 
+#define BUFFSIZE 32768
+
+static void wavedump_mem(wavedump_t *wave, const void *src_buf, size_t src_len)
+{
+	uint32 i;
+	i = wave->len + src_len;
+	if (i > wave->memsize) {
+		wave->memsize = wave->memsize * 1.5;
+		wave->mem = realloc(wave->mem, wave->memsize);
+		if (!wave->mem) {
+			fprintf(stderr, "ERROR: Could not allocate output buffer.\n");
+			exit(-1);
+		}
+	}
+	memcpy(wave->mem + wave->len, src_buf, src_len);
+	wave->len = i;
+}
+
+static void wavedump_write(wavedump_t *wave, const void *src_buf, size_t src_len)
+{
+	if (wave->ismem){
+		wavedump_mem(wave, src_buf, src_len);
+	}
+	else {
+		fwrite(src_buf, src_len, 1, wave->file);
+	}
+}
+
 static void wavedump_LIST_adtl_labl_write(
 	wavedump_t *wave, uint32 point_id, const char *label
 )
@@ -75,11 +105,11 @@ static void wavedump_LIST_adtl_labl_write(
 	clabl.Size = sizeof(point_id) + label_len;
 	cLIST.Size = sizeof(adtl) + sizeof(clabl) + clabl.Size;
 
-	fwrite(&cLIST, sizeof(cLIST), 1, wave->file);
-	fwrite(&adtl, sizeof(adtl), 1, wave->file);
-	fwrite(&clabl, sizeof(clabl), 1, wave->file);
-	fwrite(&point_id, sizeof(point_id), 1, wave->file);
-	fwrite(label, label_len, 1, wave->file);
+	wavedump_write(wave, &cLIST, sizeof(cLIST));
+	wavedump_write(wave, &adtl, sizeof(adtl));
+	wavedump_write(wave, &clabl, sizeof(clabl));
+	wavedump_write(wave, &point_id, sizeof(point_id));
+	wavedump_write(wave, label, label_len);
 }
 
 static void wavedump_header_fill(
@@ -108,15 +138,39 @@ ao_bool wavedump_open(wavedump_t *wave, const char *fn)
 {
 	uint32 temp = 0;
 	assert(wave);
-
+	WAVEHEADER h;
 	wave->data_size = 0;
 	wave->loop_sample = 0;
-	wave->file = fopen_derivative(fn, ".wav");
+	wave->len = 0;
+	wave->ismem = false;
+
+	if (!strcmp(fn, "-")) {
+		wave->file = stdout;
+		wave->memsize = (8*1024*1024);
+		wave->mem = malloc(wave->memsize);
+		if (!wave->mem) {
+			fprintf(stderr, "Could not allocate output buffer.\n");
+			return false;
+		}
+		wave->ismem = true;
+	}
+	else {
+		wave->file = fopen_derivative(fn, ".wav");
+	}
+
 	if(!wave->file) {
 		return false;
 	}
-	// Jump over header, we write that one later
-	fwrite(&temp, 1, sizeof(WAVEHEADER), wave->file);
+
+	if (wave->ismem) {
+		// Jump over header
+		memset(wave->mem, 0, sizeof(h));
+		wave->len = sizeof(h);
+	}
+	else {
+		// Jump over header, we write that one later
+		fwrite(&temp, 1, sizeof(h), wave->file);
+	}
 	return true;
 }
 
@@ -135,7 +189,7 @@ void wavedump_append(wavedump_t *wave, uint32 len, void *buf)
 		// XXX: Doesn't the data need to be swapped on big-endian platforms?
 		// That would mean that we need to know the target wave format on
 		// opening time.
-		fwrite(buf, len, 1, wave->file);
+		wavedump_write(wave, buf, len);
 	}
 }
 
@@ -146,13 +200,14 @@ void wavedump_finish(
 	assert(wave);
 	if(wave->file) {
 		WAVEHEADER h;
+		uint32 file_size;
 		// RIFF chunks have to be word-aligned, so we have to pad out the
 		// data chunk if the number of samples happens to be odd.
 		if(wave->data_size & 1) {
 			uint8 pad = 0;
 			// fwrite() rather than wavedump_append(), as the chunk size
 			// obviously doesn't include the padding.
-			fwrite(&pad, sizeof(pad), 1, wave->file);
+			wavedump_write(wave, &pad, sizeof(pad));
 		}
 		if(wave->loop_sample) {
 			// Write the "cue " chunk, as well as an additional
@@ -170,16 +225,61 @@ void wavedump_finish(
 			point.dwSampleOffset = LE32(wave->loop_sample);
 			point.fccChunk = LE32(*(uint32*)"data");
 
-			fwrite(&cue, sizeof(cue), 1, wave->file);
-			fwrite(&point, sizeof(point), 1, wave->file);
+			wavedump_write(wave, &cue, sizeof(cue));
+			wavedump_write(wave, &point, sizeof(point));
 			wavedump_LIST_adtl_labl_write(wave, 0, "Loop point");
 		}
+
+		if (wave->ismem) {
+			file_size = wave->len;
+		}
+		else {
+			file_size = ftell(wave->file);
+		}
 		wavedump_header_fill(
-			&h, wave->data_size, ftell(wave->file),
+			&h, wave->data_size, file_size,
 			sample_rate, bits_per_sample, channels
 		);
-		fseek(wave->file, 0, SEEK_SET);
-		fwrite(&h, sizeof(h), 1, wave->file);
+
+		if (wave->ismem) {
+			// Insert the proper wav header
+			memcpy(wave->mem, &h, sizeof(h));
+
+			uint32 bytes, i, q, r, bq;
+
+			bytes = BUFFSIZE * sizeof(stereo_sample_t) * 2;
+			q = file_size / bytes;
+			r = file_size % bytes;
+			bq = bytes * q;
+
+			// fprintf(stderr, "WAV length: %d\n", file_size);
+			// fprintf(stderr, "bytes: %d\n", bytes);
+			// fprintf(stderr, "quotient: %d\n", q);
+			// fprintf(stderr, "remainder: %d\n", r);
+			// fprintf(stderr, "bytes*quotient: %d\n", bq);
+
+			setvbuf(stdout, NULL, _IOFBF, bytes);
+
+			for (i = 0; i < bq; ) {
+				if (fwrite(wave->mem + i, 1, bytes, stdout) != bytes) {
+					fprintf(stderr, "ERROR: Failed writing output.\n");
+					break;
+					}
+				i += bytes;
+				if (i == bq) {
+					// fprintf(stderr, "i: %d\n", i);
+					if (fwrite(wave->mem + bq, 1, r, stdout) != r) {
+					fprintf(stderr, "ERROR: Failed writing output.\n");
+					break;
+					}
+				}
+			}
+			free(wave->mem);
+		}
+		else {
+			fseek(wave->file, 0, SEEK_SET);
+			fwrite(&h, sizeof(h), 1, wave->file);
+		}
 		fclose(wave->file);
 		wave->file = NULL;
 	}

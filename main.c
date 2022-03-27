@@ -28,6 +28,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <fcntl.h>
 
 #include "argparse/argparse.h"
 #include "ao.h"
@@ -36,6 +37,10 @@
 #include "m1sdr.h"
 #include "mididump.h"
 #include "wavedump.h"
+
+#ifndef STDOUT_FILENO
+#define STDOUT_FILENO 1
+#endif
 
 /* file types */
 static uint32 type;
@@ -112,7 +117,7 @@ int ao_get_lib(const char *filename, uint8 **buffer, uint64 *length)
 	auxfile = ao_fopen(filename, "rb");
 	if (!auxfile)
 	{
-		printf("Unable to find auxiliary file %s\n", filename);
+		fprintf(stderr, "Unable to find auxiliary file %s\n", filename);
 		return AO_FAIL;
 	}
 
@@ -125,7 +130,7 @@ int ao_get_lib(const char *filename, uint8 **buffer, uint64 *length)
 	if (!filebuf)
 	{
 		fclose(auxfile);
-		printf("ERROR: could not allocate %d bytes of memory\n", size);
+		fprintf(stderr, "ERROR: could not allocate %d bytes of memory\n", size);
 		return AO_FAIL;
 	}
 
@@ -183,6 +188,10 @@ int main(int argc, const char *argv[])
 #endif
 	int nosamples = false;
 	int nowave = false;
+	int noinfo = false;
+	int onlyinfo = false;
+    int json = false;
+	char *outfile = NULL;
 
 	const char *const usages[] =
 	{
@@ -208,6 +217,10 @@ int main(int argc, const char *argv[])
 		#endif
 		OPT_BOOLEAN('s', "nosamples", &nosamples, "don't dump any instrument samples"),
 		OPT_BOOLEAN('w', "nowave", &nowave, "don't dump the song to a .wav file"),
+		OPT_BOOLEAN('i', "noinfo", &noinfo, "don't display info tags"),
+		OPT_BOOLEAN('I', "onlyinfo", &onlyinfo, "only display info tags (no play/decode/dump)"),
+        OPT_BOOLEAN('J', "json", &json, "display tags as json (clean stderr)"),
+		OPT_STRING('o', "outfile", &outfile, "output file (wav): - (stdout) OR path to file without extension\n"),
 		OPT_END()
 	};
 
@@ -216,7 +229,8 @@ int main(int argc, const char *argv[])
 	argparse_describe(&argparse,
 		"\n"
 		"AOSDK test program v1.0 by R. Belmont [AOSDK release 1.4.8]\n"
-		"Copyright (c) 2007-2009 R. Belmont and Richard Bannister - please read license.txt for license details",
+		"Copyright (c) 2007-2009 R. Belmont and Richard Bannister - please read license.txt for license details\n"
+		"r20220327",
 		NULL
 	);
 
@@ -225,7 +239,7 @@ int main(int argc, const char *argv[])
 #ifndef NOPLAY
 	if (list_devices)
 	{
-		printf("Available output devices:\n");
+		fprintf(stdout, "Available output devices:\n");
 		m1sdr_PrintDevices();
 		return 0;
 	}
@@ -238,11 +252,25 @@ int main(int argc, const char *argv[])
 		return -1;
 	}
 
+	if (outfile) {
+		if(!strcmp(outfile, "-")) {
+			if (isatty(STDOUT_FILENO)) {
+				fprintf(stderr, "ERROR: Should not output wav to terminal.\nUse pipe or redirect to file.\n");
+				return -1;
+			}
+#if defined(_WIN32)
+			_setmode (_fileno (stdout), O_BINARY);
+#endif
+			nomidi = true;
+			nosamples = true;
+		}
+	}
+
 	file = ao_fopen(argv[0], "rb");
 
 	if (!file)
 	{
-		printf("ERROR: could not open file %s\n", argv[0]);
+		fprintf(stderr, "ERROR: could not open file %s\n", argv[0]);
 		return -1;
 	}
 
@@ -262,7 +290,7 @@ int main(int argc, const char *argv[])
 	if (!buffer)
 	{
 		fclose(file);
-		printf("ERROR: could not allocate %d bytes of memory\n", size);
+		fprintf(stderr, "ERROR: could not allocate %d bytes of memory\n", size);
 		return -1;
 	}
 
@@ -288,11 +316,17 @@ int main(int argc, const char *argv[])
 	// now did we identify it above or just fall through?
 	if (types[type].sig != 0xffffffff)
 	{
-		printf("File identified as %s\n", types[type].name);
+	    if(!json)
+        {
+        	fprintf(stderr, "File identified as %s\n", types[type].name);
+        }
 	}
 	else
 	{
-		printf("ERROR: File is unknown, signature bytes are %02x %02x %02x %02x\n", buffer[0], buffer[1], buffer[2], buffer[3]);
+		fprintf(stderr,
+				"ERROR: File is unknown, signature bytes are %02x %02x %02x %02x\n",
+				buffer[0], buffer[1], buffer[2], buffer[3]
+				);
 		free(buffer);
 		return -1;
 	}
@@ -300,13 +334,63 @@ int main(int argc, const char *argv[])
 	if ((*types[type].start)(buffer, size) != AO_SUCCESS)
 	{
 		free(buffer);
-		printf("ERROR: Engine rejected file!\n");
+		fprintf(stderr, "ERROR: Engine rejected file!\n");
 		return -1;
+	}
+
+	ao_display_info *tags = malloc(sizeof(ao_display_info));
+    (*types[type].fillinfo)(tags);
+
+    if(json)
+    {
+		fprintf(stderr,
+				"{ \"format\": \"%s\", \"title\": \"%s\", \"album\": \"%s\", \"artist\": \"%s\", \"copyright\": \"%s\", \"year\": \"%s\" }\n",
+				types[type].name,
+				(tags->info[1])? tags->info[1] : "",
+				(tags->info[2])? tags->info[2] : "",
+				(tags->info[3])? tags->info[3] : "",
+				(tags->info[4])? tags->info[4] : "",
+				(tags->info[5])? tags->info[5] : ""
+				);
+    }
+
+	if(!noinfo && !json)
+	{
+		fprintf(stderr, "Name: %s\nGame: %s\nArtist: %s\nCopyright: %s\nYear: %s\nLength: %s\nFade: %s\n",
+				(tags->info[1])? tags->info[1] : "",
+				(tags->info[2])? tags->info[2] : "",
+				(tags->info[3])? tags->info[3] : "",
+				(tags->info[4])? tags->info[4] : "",
+				(tags->info[5])? tags->info[5] : "",
+				(tags->info[6])? tags->info[6] : "",
+				(tags->info[7])? tags->info[7] : ""
+				);
+		// fprintf(stderr, "Format: %s\n" , types[type].name);
+	}
+
+	if(onlyinfo)
+	{
+		free(tags);
+		free(buffer);
+		return 0;
+	}
+
+	if(outfile)
+	{
+		argv[0] = outfile;
 	}
 
 	if(!nowave && wavedump_open(&song_dump, argv[0]))
 	{
-		printf("Dumping to %s%s.\n", argv[0], ".wav");
+	    if(!json)
+        {
+			if (!strcmp(argv[0], "-")) {
+				fprintf(stderr, "\nDumping to stdout.\n");
+			}
+			else {
+				fprintf(stderr, "\nDumping to %s%s.\n", argv[0], ".wav");
+			}
+        }
 	}
 
 	signal(SIGINT, intr_handler);
@@ -339,13 +423,24 @@ int main(int argc, const char *argv[])
 		m1sdr_Init(device, 44100);
 		m1sdr_SetCallback(do_frame);
 		m1sdr_PlayStart();
-		printf("Playing.  ");
+		fprintf(stderr, "\nPlaying.  ");
 	}
 #endif
-	printf(
-		"Press CTRL-C %sto stop.\n",
-		nogui ? "" : "or close the debug window "
-	);
+
+    if(!nowave && !json)
+    {
+        fprintf(stderr, 
+                "Press CTRL-C %sto stop.\n\n",
+                nogui ? "" : "or close the debug window "
+        );
+    }
+
+    if(noplay && nowave)
+    {
+		free(tags);
+        free(buffer);
+        return 0;
+	}
 
 	while (!ao_song_done)
 	{
@@ -377,6 +472,7 @@ int main(int argc, const char *argv[])
 	signal(SIGINT, SIG_IGN);
 	wavedump_finish(&song_dump, 44100, 16, 2);
 
+	free(tags);
 	free(buffer);
 
 	if(!nomidi) {
